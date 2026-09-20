@@ -613,9 +613,12 @@ sources, in order of decreasing precedence:
 1. **command line input** ({attr}`ParameterSource.COMMANDLINE`),
 2. **environment variable** named in `envvar=` or derived from `auto_envvar_prefix`
    ({attr}`ParameterSource.ENVIRONMENT`),
-3. **`default_map` entry** matching the parameter name on the active {class}`Context`
+3. **config file entry** from a file listed in `default_config_files` on the
+   active {class}`Context` ({attr}`ParameterSource.CONFIG`), if that layer is
+   enabled,
+4. **`default_map` entry** matching the parameter name on the active {class}`Context`
    ({attr}`ParameterSource.DEFAULT_MAP`),
-4. **parameter default** ({attr}`ParameterSource.DEFAULT`).
+5. **parameter default** ({attr}`ParameterSource.DEFAULT`).
 
 The first source that produces a value wins. Environment variables and
 `default_map` entries set to `Sentinel.UNSET` are skipped, so they fall through

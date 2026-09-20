@@ -375,8 +375,11 @@ in the following order of precedence:
 1.  **Prompt** (`PROMPT`): interactively provided by the user at a prompt.
 2.  **Command line** (`COMMANDLINE`): provided as a CLI argument or option.
 3.  **Environment variable** (`ENVIRONMENT`): read from an environment variable.
-4.  **Default map** (`DEFAULT_MAP`): looked up from {attr}`Context.default_map`.
-5.  **Default** (`DEFAULT`): the default value defined on the parameter.
+4.  **Config file** (`CONFIG`): read from a configuration file listed in
+    {attr}`Context.default_config_files`. Disabled unless that attribute is
+    set. See [Configuration File Defaults](commands.md#config-file-defaults).
+5.  **Default map** (`DEFAULT_MAP`): looked up from {attr}`Context.default_map`.
+6.  **Default** (`DEFAULT`): the default value defined on the parameter.
 
 {class}`~click.core.ParameterSource` members are ordered from most
 explicit to least explicit. Because it is an {class}`~enum.IntEnum`,

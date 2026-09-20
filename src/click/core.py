@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections.abc as cabc
+import configparser
 import enum
 import errno
 import inspect
@@ -191,6 +192,9 @@ class ParameterSource(enum.IntEnum):
         Use :class:`~enum.IntEnum` and reorder members from most to
         least explicit. Supports comparison operators.
 
+    .. versionchanged:: 8.6
+        Added the ``CONFIG`` value.
+
     .. versionchanged:: 8.0
         Use :class:`~enum.Enum` and drop the ``validate`` method.
 
@@ -204,6 +208,9 @@ class ParameterSource(enum.IntEnum):
     """The value was provided by the command line args."""
     ENVIRONMENT = enum.auto()
     """The value was provided with an environment variable."""
+    CONFIG = enum.auto()
+    """The value was provided by a configuration file listed in
+    :attr:`Context.default_config_files`."""
     DEFAULT_MAP = enum.auto()
     """Used a default provided by :attr:`Context.default_map`."""
     DEFAULT = enum.auto()
@@ -237,6 +244,20 @@ class Context:
                                variables which are always read.
     :param default_map: a dictionary (like object) with default values
                         for parameters.
+    :param default_config_files: an optional path, or sequence of paths,
+                        to INI-style configuration files providing an
+                        extra layer of parameter defaults. Values from
+                        these files take precedence over
+                        :attr:`default_map` and parameter defaults, but
+                        are overridden by environment variables and
+                        command line arguments. Values sourced this way
+                        are reported as :attr:`ParameterSource.CONFIG`.
+                        Files that do not exist are silently skipped. If
+                        this is `None`, the value is inherited from the
+                        parent context. The config file layer is disabled
+                        by default.
+
+                        .. versionadded:: 8.6
     :param terminal_width: the width of the terminal.  The default is
                            inherit from parent context.  If no context
                            defines the terminal width then auto
@@ -281,6 +302,9 @@ class Context:
         context. ``Command.show_default`` overrides this default for the
         specific command.
 
+    .. versionchanged:: 8.6
+        Added the ``default_config_files`` parameter.
+
     .. versionchanged:: 8.2
         The ``protected_args`` attribute is deprecated and will be removed in
         Click 9.0. ``args`` will contain remaining unparsed tokens.
@@ -324,6 +348,8 @@ class Context:
     obj: t.Any
     _meta: dict[str, t.Any]
     default_map: cabc.MutableMapping[str, t.Any] | None
+    default_config_files: tuple[str, ...] | None
+    _config_cache: dict[str, tuple[str, str]] | None
     invoked_subcommand: str | None
     terminal_width: int | None
     max_content_width: int | None
@@ -350,6 +376,10 @@ class Context:
         obj: t.Any | None = None,
         auto_envvar_prefix: str | None = None,
         default_map: cabc.MutableMapping[str, t.Any] | None = None,
+        default_config_files: cabc.Sequence[str | os.PathLike[str]]
+        | str
+        | os.PathLike[str]
+        | None = None,
         terminal_width: int | None = None,
         max_content_width: int | None = None,
         resilient_parsing: bool = False,
@@ -397,6 +427,25 @@ class Context:
             default_map = parent.default_map.get(info_name)
 
         self.default_map = default_map
+
+        if default_config_files is None:
+            if parent is not None:
+                default_config_files = parent.default_config_files
+        elif isinstance(default_config_files, (str, os.PathLike)):
+            default_config_files = (os.fspath(default_config_files),)
+        else:
+            default_config_files = tuple(
+                os.fspath(path) for path in default_config_files
+            )
+
+        #: Paths to INI configuration files consulted for parameter
+        #: values, or `None` if the config file layer is disabled.
+        #: Inherited from the parent context when not given.
+        #:
+        #: .. versionadded:: 8.6
+        self.default_config_files = default_config_files
+        # Cache of parsed config file contents, see `_read_config_files`.
+        self._config_cache = None
 
         #: This flag indicates if a subcommand is going to be executed. A
         #: group callback can use this information to figure out if it's
@@ -808,6 +857,120 @@ class Context:
             return value()
 
         return value
+
+    def _read_config_files(self) -> dict[str, tuple[str, str]]:
+        """Parse :attr:`default_config_files` and cache the result.
+
+        Returns a dict mapping normalized config keys (lowercase, with
+        dashes replaced by underscores) to ``(value, file_path)`` tuples.
+        Files listed later override earlier ones, and within each file a
+        section named after the command overrides the ``default``
+        section.
+
+        :meta private:
+
+        .. versionadded:: 8.6
+        """
+        if self._config_cache is not None:
+            return self._config_cache
+
+        values: dict[str, tuple[str, str]] = {}
+
+        if self.default_config_files is not None:
+            for path in self.default_config_files:
+                # Missing files are silently skipped.
+                if not os.path.isfile(path):
+                    continue
+
+                parser = configparser.ConfigParser(
+                    default_section="default", interpolation=None
+                )
+                # Keys are normalized manually below, preserve their case.
+                parser.optionxform = str  # type: ignore[assignment]
+
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        parser.read_file(f)
+                except configparser.Error as e:
+                    lineno = getattr(e, "lineno", None)
+
+                    if lineno is None:
+                        errors = getattr(e, "errors", None)
+
+                        if errors:
+                            lineno = errors[0][0]
+
+                    location = f" at line {lineno}" if lineno is not None else ""
+                    raise ClickException(
+                        f"Could not parse config file {path!r}{location}: {e}"
+                    ) from e
+
+                section_items: list[tuple[str, str]] = list(parser.defaults().items())
+
+                if self.info_name is not None and parser.has_section(self.info_name):
+                    section_items.extend(parser.items(self.info_name))
+
+                for key, value in section_items:
+                    norm_key = key.lower().replace("-", "_")
+                    values[norm_key] = (value, path)
+
+        self._config_cache = values
+        return values
+
+    def lookup_config(self, name: str | None) -> str | None:
+        """Look up a parameter's value in the configured config files.
+
+        Returns the raw string value, or `None` if the config file layer
+        is disabled, the key is absent, or the value is empty. Keys are
+        matched case-insensitively, and dashes are treated as equivalent
+        to underscores.
+
+        :meta private:
+
+        .. versionadded:: 8.6
+        """
+        if name is None or self.default_config_files is None:
+            return None
+
+        try:
+            values = self._read_config_files()
+        except ClickException:
+            # A malformed config file must not break resilient parsing
+            # (shell completion); treat it as if no value was found.
+            if self.resilient_parsing:
+                return None
+
+            raise
+
+        result = values.get(name.lower().replace("-", "_"))
+
+        if result is None:
+            return None
+
+        value = result[0]
+        # An empty value is treated as unset, mirroring how empty
+        # environment variables are skipped.
+        return value if value != "" else None
+
+    def _config_origin(self, name: str | None) -> tuple[str, str] | None:
+        """Return the ``(key, path)`` identifying where ``name`` was
+        found in the config files, or `None` if it was not found. Used
+        to point out the config file in error messages.
+
+        :meta private:
+
+        .. versionadded:: 8.6
+        """
+        if name is None or self.default_config_files is None:
+            return None
+
+        key = name.lower().replace("-", "_")
+        values = self._read_config_files()
+
+        if key not in values:
+            return None
+
+        return key, values[key][1]
 
     def fail(self, message: str) -> t.NoReturn:
         """Aborts the execution of the program with a specific error
@@ -2511,9 +2674,10 @@ class Parameter(ABC):
     ) -> tuple[t.Any, ParameterSource]:
         """Returns the parameter value produced by the parser.
 
-        If the parser did not produce a value from user input, the value is either
-        sourced from the environment variable, the default map, or the parameter's
-        default value. In that order of precedence.
+        If the parser did not produce a value from user input, the value is
+        sourced from the environment variable, the config files (if
+        :attr:`Context.default_config_files` is set), the default map, or the
+        parameter's default value. In that order of precedence.
 
         If no value is found, an internal sentinel value is returned.
 
@@ -2534,6 +2698,12 @@ class Parameter(ABC):
             if envvar_value is not None:
                 value = envvar_value
                 source = ParameterSource.ENVIRONMENT
+
+        if value is UNSET:
+            config_value = self.value_from_config(ctx)
+            if config_value is not None:
+                value = config_value
+                source = ParameterSource.CONFIG
 
         if value is UNSET:
             default_map_value = ctx.lookup_default(self.name)
@@ -2755,6 +2925,26 @@ class Parameter(ABC):
 
         return rv
 
+    def value_from_config(self, ctx: Context) -> str | cabc.Sequence[str] | None:
+        """Look up this parameter's value in the context's config files.
+
+        Returns the raw string as-is, or splits it into a sequence of
+        strings if the parameter is expecting multiple values (i.e. its
+        :attr:`nargs` property is set to a value other than ``1``).
+        Returns `None` if the config file layer is disabled or holds no
+        value for this parameter.
+
+        :meta private:
+
+        .. versionadded:: 8.6
+        """
+        rv = ctx.lookup_config(self.name)
+
+        if rv is not None and self.nargs != 1:
+            return self.type.split_envvar_value(rv)
+
+        return rv
+
     def handle_parse_result(
         self, ctx: Context, opts: cabc.Mapping[str, t.Any], args: list[str]
     ) -> tuple[t.Any, list[str]]:
@@ -2804,8 +2994,24 @@ class Parameter(ABC):
             # Process the value through the parameter's type.
             try:
                 value = self.process_value(ctx, value)
-            except Exception:
+            except Exception as e:
                 if not ctx.resilient_parsing:
+                    # Point out the config file and key a bad value came
+                    # from, so users don't look for it on the command line.
+                    if source is ParameterSource.CONFIG and isinstance(
+                        e, BadParameter
+                    ):
+                        origin = ctx._config_origin(self.name)
+
+                        if origin is not None:
+                            key, path = origin
+                            raise BadParameter(
+                                f"{e.message} (from key {key!r} in config"
+                                f" file {path!r})",
+                                ctx=ctx,
+                                param=self,
+                            ) from e
+
                     raise
                 # In resilient parsing mode, we do not want to fail the command if the
                 # value is incompatible with the parameter type, so we reset the value
@@ -3596,8 +3802,33 @@ class Option(Parameter):
         if rv is None:
             return None
 
+        return self._process_value_string(rv)
+
+    def value_from_config(self, ctx: Context) -> t.Any:
+        """For :class:`Option`, a config file value is processed the same way
+        as an environment variable value: non-boolean flags analyze the string
+        to decide if the flag is activated, and repeated options are split.
+
+        :meta private:
+
+        .. versionadded:: 8.6
+        """
+        rv = ctx.lookup_config(self.name)
+
+        # Absent config key or an empty value is interpreted as unset.
+        if rv is None:
+            return None
+
+        return self._process_value_string(rv)
+
+    def _process_value_string(self, rv: str) -> t.Any:
+        """Process a raw string obtained from an environment variable or a
+        config file into this option's value.
+
+        :meta private:
+        """
         # Non-boolean flags are more liberal in what they accept. But a flag being a
-        # flag, its envvar value still needs to be analyzed to determine if the flag is
+        # flag, its value still needs to be analyzed to determine if the flag is
         # activated or not.
         if self.is_flag and not self.is_bool_flag:
             # An exact match against ``flag_value`` (a non-bool flag always has one
@@ -3614,7 +3845,7 @@ class Option(Parameter):
                 return None
             return self.flag_value if parsed else False
 
-        # Split the envvar value if it is allowed to be repeated.
+        # Split the value if it is allowed to be repeated.
         value_depth = (self.nargs != 1) + bool(self.multiple)
         if value_depth > 0:
             multi_rv = self.type.split_envvar_value(rv)

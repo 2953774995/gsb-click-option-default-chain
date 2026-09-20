@@ -420,6 +420,78 @@ And again the example in action:
     invoke(cli, prog_name='cli', args=['runserver'])
 ```
 
+(config-file-defaults)=
+## Configuration File Defaults
+
+```{versionadded} 8.6
+```
+
+In addition to `default_map`, Click can read parameter values from
+INI-style configuration files. This inserts a *config file* layer into
+the value resolution chain, so the full precedence becomes:
+
+1.  Command line arguments
+2.  Environment variables
+3.  Configuration files
+4.  `default_map`
+5.  Parameter defaults
+
+The layer is **disabled by default** and must be opted into per context
+with the `default_config_files` setting, which accepts a single path or
+a sequence of paths. It is inherited by subcommands, so setting it on
+the top-level group enables it everywhere:
+
+```python
+@click.group(context_settings={"default_config_files": ["click.ini"]})
+def cli():
+    pass
+```
+
+### File lookup and format
+
+Each entry in `default_config_files` is a path to one INI file, parsed
+with the standard library's `configparser` module (interpolation is
+disabled, so `%` characters are used literally). The lookup rules are:
+
+-   Files that do not exist are **silently skipped**.
+-   Files are read in order; keys from a file listed later override keys
+    from earlier files.
+-   Within each file, the `[default]` section applies to all commands,
+    and a section named after the command (its `info_name`, e.g.
+    `[runserver]`) overrides `[default]` for that command.
+-   Keys are matched against parameter names case-insensitively, and
+    dashes and underscores are equivalent: `api-token`, `api_token`, and
+    `API-TOKEN` all provide a value for `--api-token`.
+-   Keys that do not correspond to any parameter of the command are
+    silently ignored, so a shared config file stays forward compatible.
+-   Empty values are treated as unset, mirroring empty environment
+    variables.
+-   A file that cannot be parsed at all raises an error naming the file
+    and the offending line.
+
+Example `click.ini`:
+
+```ini
+[default]
+workers = 4
+
+[runserver]
+port = 5000
+```
+
+### Value handling
+
+Config file values go through the same type conversion as command line
+values (`type=`, `multiple`, `nargs`, and flag semantics all apply, and
+multi-value parameters are split the same way environment variable
+values are). If conversion fails, the error message names the config
+file and the key the value came from.
+
+Values sourced from a config file are reported as
+{attr}`~click.core.ParameterSource.CONFIG` by
+{meth}`Context.get_parameter_source`, which ranks between
+`ENVIRONMENT` and `DEFAULT_MAP`.
+
 ## Command Return Values
 
 ```{versionadded} 3.0

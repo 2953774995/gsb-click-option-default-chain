@@ -1,3 +1,14 @@
+## Version 8.6.0
+
+Unreleased
+
+- Add an optional config file layer to parameter value resolution. Setting
+  `Context.default_config_files` (or the `default_config_files` context
+  setting) makes Click read INI-style config files between environment
+  variables and `default_map`/parameter defaults, and report values sourced
+  this way as the new `ParameterSource.CONFIG` member. Disabled by default;
+  existing behavior is unchanged unless opted in.
+
 ## Version 8.5.1
 
 Unreleased
